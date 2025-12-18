@@ -59,6 +59,7 @@ from sklearn.model_selection import BaseCrossValidator
 from sklearn.utils.validation import check_is_fitted
 from sklearn.utils.validation import validate_data
 from sklearn.metrics.pairwise import pairwise_distances
+from sklearn.utils.multiclass import check_classification_targets
 
 
 class KNearestNeighbors(ClassifierMixin, BaseEstimator):
@@ -82,6 +83,15 @@ class KNearestNeighbors(ClassifierMixin, BaseEstimator):
         self : instance of KNearestNeighbors
             The current instance of the classifier
         """
+        X, y = validate_data(
+            self,
+            X,
+            y,
+        )
+        check_classification_targets(y)
+        self.X_train_ = X
+        self.y_train_ = y
+        self.classes_ = np.unique(y)
         return self
 
     def predict(self, X):
@@ -97,7 +107,27 @@ class KNearestNeighbors(ClassifierMixin, BaseEstimator):
         y : ndarray, shape (n_test_samples,)
             Predicted class labels for each test data sample.
         """
-        y_pred = np.zeros(X.shape[0])
+        check_is_fitted(self, attributes=["X_train_", "y_train_"])
+
+        X = validate_data(
+            self,
+            X,
+            # we are only checking, we already stored during the fit
+            reset=False,
+            ensure_2d=True,
+            dtype="numeric",
+        )
+        distances = pairwise_distances(X, self.X_train_)
+        # take all the rows, choose until # neighbors elements
+        indices = np.argsort(distances, axis=1)[:, :self.n_neighbors]
+        labels = self.y_train_[indices]
+        # now we do majority vote
+        y_pred = np.array([
+            np.unique(labels_sample, return_counts=True)[0][
+                np.argmax(np.unique(labels_sample, return_counts=True)[1])
+            ]
+            for labels_sample in labels
+        ])
         return y_pred
 
     def score(self, X, y):
@@ -115,7 +145,9 @@ class KNearestNeighbors(ClassifierMixin, BaseEstimator):
         score : float
             Accuracy of the model computed for the (X, y) pairs.
         """
-        return 0.
+        predictions = self.predict(X)
+        score = np.mean(predictions == y)
+        return score
 
 
 class MonthlySplit(BaseCrossValidator):
@@ -155,7 +187,20 @@ class MonthlySplit(BaseCrossValidator):
         n_splits : int
             The number of splits.
         """
-        return 0
+        if self.time_col == 'index':
+            if not isinstance(X.index, pd.DatetimeIndex):
+                raise ValueError("Index must be a DatetimeIndex")
+            months = X.index.to_period("M").unique()
+        else:
+            if not hasattr(X, "columns"):
+                raise ValueError("X must be a DataFrame when time_col "
+                                 "is not 'index'")
+            if self.time_col not in X.columns:
+                raise ValueError(f"{self.time_col} not in DataFrame")
+            if not pd.api.types.is_datetime64_any_dtype(X[self.time_col]):
+                raise ValueError("time_col must be datetime")
+            months = X[self.time_col].dt.to_period("M").unique()
+        return max(len(months) - 1, 0)
 
     def split(self, X, y, groups=None):
         """Generate indices to split data into training and test set.
@@ -178,11 +223,30 @@ class MonthlySplit(BaseCrossValidator):
             The testing set indices for that split.
         """
 
-        n_samples = X.shape[0]
         n_splits = self.get_n_splits(X, y, groups)
+        if self.time_col == 'index':
+            if not isinstance(X.index, pd.DatetimeIndex):
+                raise ValueError("Index must be a DatetimeIndex")
+            time = X.index
+        else:
+            if not hasattr(X, "columns"):
+                raise ValueError("X must be a DataFrame when time_col is not "
+                                 "'index'")
+            if self.time_col not in X.columns:
+                raise ValueError(f"{self.time_col} not in DataFrame")
+            if not pd.api.types.is_datetime64_any_dtype(X[self.time_col]):
+                raise ValueError("time_col must be datetime")
+            time = X[self.time_col]
+        order = np.argsort(time.values)
+        time_sorted = time.values[order]
+        months = pd.Series(time_sorted).dt.to_period("M").values
+        unique_months = pd.unique(months)
         for i in range(n_splits):
-            idx_train = range(n_samples)
-            idx_test = range(n_samples)
+            train_month = unique_months[i]  # get the first month
+            test_month = unique_months[i + 1]
+
+            idx_train = order[months == train_month]
+            idx_test = order[months == test_month]
             yield (
                 idx_train, idx_test
             )
